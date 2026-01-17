@@ -32,7 +32,7 @@ from auth import (
     get_password_hash, verify_password, create_access_token,
     require_admin_or_rh, require_admin, require_employee_or_above
 )
-from services import check_and_send_absence_alerts, check_night_vehicle_presence, process_complaint_sanction
+from services import check_and_send_absence_alerts, check_night_vehicle_presence, process_complaint_alert
 
 # Créer les tables
 Base.metadata.create_all(bind=engine)
@@ -520,8 +520,12 @@ async def list_complaints(
     db: Session = Depends(get_db)
 ):
     """Gérer les réclamations"""
-    complaints = db.query(Complaint).offset(skip).limit(limit).order_by(Complaint.created_at.desc()).all()
-    return complaints
+    try:
+        complaints = db.query(Complaint).order_by(Complaint.created_at.desc()).offset(skip).limit(limit).all()
+        return complaints
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des réclamations: {str(e)}\n{traceback.format_exc()}")
 
 @app.put("/api/admin/complaints/{complaint_id}", response_model=ComplaintResponse, tags=["Gérer Réclamations"])
 async def update_complaint(
@@ -530,19 +534,45 @@ async def update_complaint(
     current_user: User = Depends(require_admin_or_rh),
     db: Session = Depends(get_db)
 ):
-    """Modifier le statut d'une réclamation"""
-    complaint = db.query(Complaint).filter(Complaint.id == complaint_id).first()
-    if not complaint:
-        raise HTTPException(status_code=404, detail="Réclamation non trouvée")
-    
-    if complaint_update.status:
-        complaint.status = complaint_update.status
-        # Traiter la réclamation si nécessaire
-        process_complaint_sanction(db, complaint)
-    
-    db.commit()
-    db.refresh(complaint)
-    return complaint
+    """
+    Approuver une réclamation (ne permet que de passer de OPEN à WARNING_SENT).
+    Quand une réclamation est approuvée, une alerte PARKING_VIOLATION est créée pour l'employé accusé.
+    Après 3 alertes PARKING_VIOLATION, l'employé est automatiquement sanctionné (banni 3 jours).
+    """
+    try:
+        complaint = db.query(Complaint).filter(Complaint.id == complaint_id).first()
+        if not complaint:
+            raise HTTPException(status_code=404, detail="Réclamation non trouvée")
+        
+        # Ne permettre que d'approuver une réclamation (OPEN -> WARNING_SENT)
+        if complaint_update.status:
+            if complaint.status != ComplaintStatusEnum.OPEN:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Impossible de modifier le statut. La réclamation est déjà {complaint.status.value}"
+                )
+            
+            if complaint_update.status != ComplaintStatusEnum.WARNING_SENT:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Vous ne pouvez qu'approuver la réclamation (statut WARNING_SENT). Pour sanctionner après 3 alertes, cela se fait automatiquement."
+                )
+            
+            # Approuver la réclamation
+            complaint.status = ComplaintStatusEnum.WARNING_SENT
+            
+            # Traiter la réclamation : créer une alerte PARKING_VIOLATION
+            process_complaint_alert(db, complaint)
+        
+        db.commit()
+        db.refresh(complaint)
+        return complaint
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la mise à jour de la réclamation: {str(e)}")
 
 @app.get("/api/admin/absences", response_model=List[AbsenceResponse], tags=["Gérer Absences"])
 async def list_absences(
@@ -553,11 +583,15 @@ async def list_absences(
     db: Session = Depends(get_db)
 ):
     """Gérer les absences"""
-    query = db.query(Absence)
-    if status_filter:
-        query = query.filter(Absence.status == status_filter)
-    absences = query.offset(skip).limit(limit).order_by(Absence.created_at.desc()).all()
-    return absences
+    try:
+        query = db.query(Absence)
+        if status_filter:
+            query = query.filter(Absence.status == status_filter)
+        absences = query.order_by(Absence.created_at.desc()).offset(skip).limit(limit).all()
+        return absences
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des absences: {str(e)}\n{traceback.format_exc()}")
 
 @app.put("/api/admin/absences/{absence_id}/verify", response_model=AbsenceResponse, tags=["Gérer Absences"])
 async def verify_absence(
@@ -567,14 +601,23 @@ async def verify_absence(
     db: Session = Depends(get_db)
 ):
     """Vérifier une justification d'absence (approuver ou rejeter)"""
-    absence = db.query(Absence).filter(Absence.id == absence_id).first()
-    if not absence:
-        raise HTTPException(status_code=404, detail="Absence non trouvée")
-    
-    absence.status = status
-    db.commit()
-    db.refresh(absence)
-    return absence
+    try:
+        absence = db.query(Absence).filter(Absence.id == absence_id).first()
+        if not absence:
+            raise HTTPException(status_code=404, detail="Absence non trouvée")
+        
+        absence.status = status
+        db.commit()
+        db.refresh(absence)
+        return absence
+    except Exception as e:
+        db.rollback()
+        if "locked" in str(e).lower():
+            raise HTTPException(
+                status_code=503, 
+                detail="La base de données est verrouillée. Veuillez fermer DB Browser for SQLite ou tout autre programme utilisant la base de données, puis réessayez."
+            )
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la vérification de l'absence: {str(e)}")
 
 @app.post("/api/admin/sanctions", response_model=SanctionResponse, status_code=status.HTTP_201_CREATED, tags=["Gérer Sanctions"])
 async def create_sanction(
@@ -582,21 +625,47 @@ async def create_sanction(
     current_user: User = Depends(require_admin_or_rh),
     db: Session = Depends(get_db)
 ):
-    """Sanctionner un employé"""
-    # Vérifier que le véhicule existe
-    vehicle = db.query(Vehicle).filter(Vehicle.id == sanction.vehicle_id).first()
-    if not vehicle:
-        raise HTTPException(status_code=404, detail="Véhicule non trouvé")
-    
-    db_sanction = Sanction(**sanction.dict())
-    db.add(db_sanction)
-    
-    # Désautoriser le véhicule pendant la période de sanction
-    vehicle.is_authorized = False
-    
-    db.commit()
-    db.refresh(db_sanction)
-    return db_sanction
+    """
+    Sanctionner manuellement un employé.
+    Un email sera automatiquement envoyé à l'employé concerné.
+    """
+    try:
+        # Vérifier que le véhicule existe
+        vehicle = db.query(Vehicle).filter(Vehicle.id == sanction.vehicle_id).first()
+        if not vehicle:
+            raise HTTPException(status_code=404, detail="Véhicule non trouvé")
+        
+        db_sanction = Sanction(**sanction.dict())
+        db.add(db_sanction)
+        
+        # Désautoriser le véhicule pendant la période de sanction
+        vehicle.is_authorized = False
+        
+        # Envoyer un email à l'employé
+        if vehicle.employee_id:
+            employee = db.query(Employee).filter(Employee.id == vehicle.employee_id).first()
+            if employee and employee.email:
+                from services import send_email
+                send_email(
+                    employee.email,
+                    "SANCTION - Bannissement du parking",
+                    f"Bonjour {employee.first_name} {employee.last_name},\n\n"
+                    f"Votre véhicule {vehicle.plate_number} est sanctionné et banni du parking "
+                    f"du {sanction.start_date} au {sanction.end_date}.\n\n"
+                    f"Raison : {sanction.reason}\n\n"
+                    f"Durant cette période, l'accès au parking vous sera refusé.\n\n"
+                    f"Cordialement,\nL'administration STEG"
+                )
+        
+        db.commit()
+        db.refresh(db_sanction)
+        return db_sanction
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la création de la sanction: {str(e)}")
 
 @app.get("/api/admin/sanctions", response_model=List[SanctionResponse], tags=["Gérer Sanctions"])
 async def list_sanctions(
@@ -606,8 +675,12 @@ async def list_sanctions(
     db: Session = Depends(get_db)
 ):
     """Liste des sanctions"""
-    sanctions = db.query(Sanction).offset(skip).limit(limit).order_by(Sanction.created_at.desc()).all()
-    return sanctions
+    try:
+        sanctions = db.query(Sanction).order_by(Sanction.created_at.desc()).offset(skip).limit(limit).all()
+        return sanctions
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des sanctions: {str(e)}\n{traceback.format_exc()}")
 
 @app.get("/api/admin/profiles", response_model=List[UserResponse], tags=["Gérer Profils"])
 async def list_profiles(
@@ -753,18 +826,36 @@ async def list_alerts(
     db: Session = Depends(get_db)
 ):
     """Liste des alertes"""
-    alerts = db.query(Alert).offset(skip).limit(limit).order_by(Alert.created_at.desc()).all()
-    return alerts
+    try:
+        alerts = db.query(Alert).order_by(Alert.created_at.desc()).offset(skip).limit(limit).all()
+        return alerts
+    except Exception as e:
+        import traceback
+        error_detail = f"Erreur lors de la récupération des alertes: {str(e)}"
+        print(f"Erreur détaillée: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_detail)
 
 @app.post("/api/admin/check-alerts", tags=["Gérer Alertes"])
 async def trigger_alert_check(
     current_user: User = Depends(require_admin),
     db: Session = Depends(get_db)
 ):
-    """Déclencher manuellement la vérification des alertes"""
-    check_and_send_absence_alerts(db)
-    check_night_vehicle_presence(db)
-    return {"message": "Vérification des alertes effectuée"}
+    """
+    Déclencher manuellement la vérification des alertes automatiques.
+    
+    Cette fonction vérifie :
+    - Les absences/retards : vérifie si les véhicules sont présents à l'heure prévue (ex: 9:01)
+    - Les véhicules ÉTAT la nuit : vérifie que les véhicules de classe ÉTAT sont présents pendant la nuit
+    
+    Normalement, ces vérifications se font automatiquement lors de chaque entrée parking (OCR).
+    Cet endpoint permet de forcer la vérification manuellement.
+    """
+    try:
+        check_and_send_absence_alerts(db)
+        check_night_vehicle_presence(db)
+        return {"message": "Vérification des alertes effectuée avec succès"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la vérification des alertes: {str(e)}")
 
 # ==================== PARKING ENTRIES (OCR) ====================
 

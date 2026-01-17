@@ -17,8 +17,8 @@ from email.mime.multipart import MIMEMultipart
 # Configuration email (à configurer selon votre serveur SMTP)
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
-SMTP_USERNAME = "saharnaoui92@gmail.com"
-SMTP_PASSWORD = "pgou ujow mwtd szmv"
+SMTP_USERNAME = "your-email@gmail.com"
+SMTP_PASSWORD = "your-password"
 
 # Configuration SMS (à configurer selon votre fournisseur SMS)
 SMS_API_URL = "https://api.sms-provider.com/send"
@@ -241,60 +241,86 @@ def check_night_vehicle_presence(db: Session):
                     db.commit()
 
 
-def process_complaint_sanction(db: Session, complaint: Complaint):
+def process_complaint_alert(db: Session, complaint: Complaint):
     """
-    Traite une réclamation et applique les sanctions si nécessaire
+    Traite une réclamation approuvée : crée une alerte PARKING_VIOLATION pour l'employé accusé.
+    Si c'est la 3ème alerte, crée automatiquement une sanction (bannissement 3 jours) et envoie un email.
     """
-    if complaint.status == ComplaintStatusEnum.OPEN:
-        # Première fois: envoyer un avertissement
-        complaint.status = ComplaintStatusEnum.WARNING_SENT
+    # Trouver le véhicule accusé
+    accused_vehicle = None
+    if complaint.accused_vehicle_id:
+        accused_vehicle = db.query(Vehicle).filter(Vehicle.id == complaint.accused_vehicle_id).first()
+    elif complaint.accused_vehicle_plate:
+        accused_vehicle = db.query(Vehicle).filter(
+            Vehicle.plate_number == complaint.accused_vehicle_plate
+        ).first()
+    
+    if not accused_vehicle or not accused_vehicle.employee_id:
+        return  # Pas de véhicule trouvé ou pas d'employé associé
+    
+    employee = db.query(Employee).filter(Employee.id == accused_vehicle.employee_id).first()
+    if not employee:
+        return
+    
+    # Créer une alerte PARKING_VIOLATION
+    alert = Alert(
+        employee_id=employee.id,
+        vehicle_id=accused_vehicle.id,
+        alert_type=AlertTypeEnum.PARKING_VIOLATION,
+        message=f"Occupation de la place de parking n°{complaint.parking_spot} réservée à un collègue (réclamation #{complaint.id})",
+        sent_email=False,
+        sent_sms=False
+    )
+    db.add(alert)
+    db.flush()
+    
+    # Envoyer email d'alerte
+    if employee.email:
+        email_sent = send_email(
+            employee.email,
+            "Alerte - Occupation de place réservée",
+            f"Bonjour {employee.first_name} {employee.last_name},\n\n"
+            f"Vous avez reçu une alerte pour avoir occupé la place de parking "
+            f"n°{complaint.parking_spot} réservée à un collègue.\n\n"
+            f"Votre véhicule : {accused_vehicle.plate_number}\n\n"
+            f"Attention : Après 3 alertes, vous serez automatiquement banni du parking pour 3 jours."
+        )
+        alert.sent_email = email_sent
+    
+    # Envoyer SMS
+    if employee.phone:
+        sms_sent = send_sms(
+            employee.phone,
+            f"ALERTE STEG: Occupation place réservée n°{complaint.parking_spot}. Attention: 3 alertes = sanction 3 jours"
+        )
+        alert.sent_sms = sms_sent
+    
+    db.flush()
+    
+    # Compter les alertes PARKING_VIOLATION pour ce véhicule
+    alert_count = db.query(Alert).filter(
+        Alert.vehicle_id == accused_vehicle.id,
+        Alert.alert_type == AlertTypeEnum.PARKING_VIOLATION
+    ).count()
+    
+    # Si c'est la 3ème alerte, créer une sanction automatique
+    if alert_count >= 3:
+        # Vérifier s'il n'y a pas déjà une sanction active
+        today = date.today()
+        existing_sanction = db.query(Sanction).filter(
+            Sanction.vehicle_id == accused_vehicle.id,
+            Sanction.start_date <= today,
+            Sanction.end_date >= today
+        ).first()
         
-        # Trouver le véhicule accusé
-        accused_vehicle = None
-        if complaint.accused_vehicle_id:
-            accused_vehicle = db.query(Vehicle).filter(Vehicle.id == complaint.accused_vehicle_id).first()
-        elif complaint.accused_vehicle_plate:
-            accused_vehicle = db.query(Vehicle).filter(
-                Vehicle.plate_number == complaint.accused_vehicle_plate
-            ).first()
-        
-        if accused_vehicle and accused_vehicle.employee_id:
-            employee = db.query(Employee).filter(Employee.id == accused_vehicle.employee_id).first()
-            if employee:
-                # Envoyer avertissement
-                if employee.email:
-                    send_email(
-                        employee.email,
-                        "Avertissement - Occupation de place réservée",
-                        f"Bonjour {employee.first_name} {employee.last_name},\n\n"
-                        f"Vous avez reçu un avertissement pour avoir occupé la place de parking "
-                        f"n°{complaint.parking_spot} réservée à un collègue.\n\n"
-                        f"En cas de récidive, vous serez banni du parking pour 3 jours."
-                    )
-        
-        db.commit()
-        
-    elif complaint.status == ComplaintStatusEnum.WARNING_SENT:
-        # Deuxième fois: bannir pour 3 jours
-        complaint.status = ComplaintStatusEnum.BANNED
-        
-        # Trouver le véhicule accusé
-        accused_vehicle = None
-        if complaint.accused_vehicle_id:
-            accused_vehicle = db.query(Vehicle).filter(Vehicle.id == complaint.accused_vehicle_id).first()
-        elif complaint.accused_vehicle_plate:
-            accused_vehicle = db.query(Vehicle).filter(
-                Vehicle.plate_number == complaint.accused_vehicle_plate
-            ).first()
-        
-        if accused_vehicle:
+        if not existing_sanction:
             # Créer une sanction de 3 jours
             start_date = date.today()
             end_date = start_date + timedelta(days=3)
             
             sanction = Sanction(
                 vehicle_id=accused_vehicle.id,
-                reason=f"Récidive d'occupation de place réservée (réclamation #{complaint.id})",
+                reason=f"3 alertes PARKING_VIOLATION reçues. Bannissement automatique pour occupation répétée de places réservées.",
                 start_date=start_date,
                 end_date=end_date
             )
@@ -303,17 +329,25 @@ def process_complaint_sanction(db: Session, complaint: Complaint):
             # Désautoriser le véhicule
             accused_vehicle.is_authorized = False
             
-            if accused_vehicle.employee_id:
-                employee = db.query(Employee).filter(Employee.id == accused_vehicle.employee_id).first()
-                if employee:
-                    if employee.email:
-                        send_email(
-                            employee.email,
-                            "Sanction - Bannissement du parking",
-                            f"Bonjour {employee.first_name} {employee.last_name},\n\n"
-                            f"Suite à une récidive d'occupation de place réservée, "
-                            f"votre véhicule {accused_vehicle.plate_number} est banni du parking "
-                            f"du {start_date} au {end_date}."
-                        )
-            
-            db.commit()
+            # Envoyer email de sanction
+            if employee.email:
+                send_email(
+                    employee.email,
+                    "SANCTION - Bannissement du parking (3 alertes reçues)",
+                    f"Bonjour {employee.first_name} {employee.last_name},\n\n"
+                    f"Vous avez reçu 3 alertes pour occupation de places réservées.\n\n"
+                    f"Votre véhicule {accused_vehicle.plate_number} est donc automatiquement banni du parking "
+                    f"du {start_date} au {end_date} (3 jours).\n\n"
+                    f"Durant cette période, l'accès au parking vous sera refusé.\n\n"
+                    f"Cordialement,\nL'administration STEG"
+                )
+    
+    db.commit()
+
+
+def process_complaint_sanction(db: Session, complaint: Complaint):
+    """
+    ANCIENNE FONCTION - CONSERVÉE POUR COMPATIBILITÉ
+    Cette fonction n'est plus utilisée car le système fonctionne maintenant avec des alertes.
+    """
+    pass

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, ConfigDict
 from typing import Optional, List
 from datetime import datetime, date, time
 from enum import Enum
@@ -58,13 +58,12 @@ class UserUpdate(BaseModel):
     password: Optional[str] = None
 
 class UserResponse(UserBase):
+    model_config = ConfigDict(from_attributes=True)
+    
     id: int
     is_active: bool
     employee_id: Optional[int] = None
     created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 class Token(BaseModel):
     access_token: str
@@ -99,12 +98,11 @@ class EmployeeUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 class EmployeeResponse(EmployeeBase):
+    model_config = ConfigDict(from_attributes=True)
+    
     id: int
     is_active: bool
     created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 # ==================== VEHICLE SCHEMAS ====================
 
@@ -130,12 +128,11 @@ class VehicleUpdate(BaseModel):
     is_authorized: Optional[bool] = None
 
 class VehicleResponse(VehicleBase):
+    model_config = ConfigDict(from_attributes=True)
+    
     id: int
     is_authorized: bool
     created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 # ==================== WORK SCHEDULE SCHEMAS ====================
 
@@ -153,10 +150,9 @@ class WorkScheduleUpdate(BaseModel):
     end_time: Optional[time] = None
 
 class WorkScheduleResponse(WorkScheduleBase):
+    model_config = ConfigDict(from_attributes=True)
+    
     id: int
-
-    class Config:
-        from_attributes = True
 
 # ==================== ABSENCE SCHEMAS ====================
 
@@ -181,13 +177,12 @@ class AbsenceUpdate(BaseModel):
     status: Optional[AbsenceStatusEnum] = None
 
 class AbsenceResponse(AbsenceBase):
+    model_config = ConfigDict(from_attributes=True)
+    
     id: int
     document_path: Optional[str] = None
     status: AbsenceStatusEnum
     created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 # ==================== COMPLAINT SCHEMAS ====================
 
@@ -204,13 +199,12 @@ class ComplaintUpdate(BaseModel):
     status: Optional[ComplaintStatusEnum] = None
 
 class ComplaintResponse(ComplaintBase):
+    model_config = ConfigDict(from_attributes=True)
+    
     id: int
     photo_path: Optional[str] = None
     status: ComplaintStatusEnum
     created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 # ==================== ALERT SCHEMAS ====================
 
@@ -221,13 +215,12 @@ class AlertBase(BaseModel):
     message: Optional[str] = None
 
 class AlertResponse(AlertBase):
+    model_config = ConfigDict(from_attributes=True)
+    
     id: int
     sent_email: bool
     sent_sms: bool
     created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 # ==================== SANCTION SCHEMAS ====================
 
@@ -241,11 +234,10 @@ class SanctionCreate(SanctionBase):
     pass
 
 class SanctionResponse(SanctionBase):
+    model_config = ConfigDict(from_attributes=True)
+    
     id: int
     created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 # ==================== PARKING ENTRY SCHEMAS ====================
 
@@ -260,10 +252,9 @@ class ParkingEntryCreate(ParkingEntryBase):
     pass
 
 class ParkingEntryResponse(ParkingEntryBase):
+    model_config = ConfigDict(from_attributes=True)
+    
     id: int
-
-    class Config:
-        from_attributes = True
 
 # ==================== STEG PHONE NUMBER SCHEMA ====================
 
